@@ -6,7 +6,7 @@ import gym
 import numpy as np
 from model import ActorCritic
 
-def worker_fn(global_model, lr, env_name, worker_id, gamma=0.99, t_max=20):
+def worker_fn(global_model, global_optimizer, env_name, worker_id, gamma=0.99, t_max=20):
     torch.manual_seed(worker_id + 1000)  # Different seed per worker
     np.random.seed(worker_id + 1000)
     
@@ -15,9 +15,6 @@ def worker_fn(global_model, lr, env_name, worker_id, gamma=0.99, t_max=20):
     
     local_model = ActorCritic(env.observation_space.shape[0], env.action_space.n)
     local_model.load_state_dict(global_model.state_dict())
-    
-    # Each worker has its own optimizer
-    optimizer = torch.optim.Adam(local_model.parameters(), lr=lr)
 
     state, _ = env.reset()
     done = False
@@ -90,26 +87,18 @@ def worker_fn(global_model, lr, env_name, worker_id, gamma=0.99, t_max=20):
         policy_loss = -(log_probs * advantages.detach()).mean()
         value_loss = F.mse_loss(values, returns)
         entropy_loss = -entropies.mean()
-
-        # Total loss with entropy bonus for exploration
         loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
 
-        # Update local model
-        optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(local_model.parameters(), max_norm=5.0)
-        
-        optimizer.step()
 
-        # Copy gradients to global model (A3C update)
-        with torch.no_grad():
-            for global_param, local_param in zip(global_model.parameters(), local_model.parameters()):
-                if global_param.grad is not None:
-                    global_param.grad.data.add_(local_param.grad.data)
-                else:
-                    global_param._grad = local_param.grad.data.clone()
+        for local_param, global_param in zip(local_model.parameters(), global_model.parameters()):
+            global_param._grad = local_param.grad.clone()
+            
+        
+        torch.nn.utils.clip_grad_norm_(global_model.parameters(), max_norm=5.0)
+        global_optimizer.step()
+        global_optimizer.zero_grad()
 
         # Print from all workers
         if episode > 0 and episode % 10 == 0:
