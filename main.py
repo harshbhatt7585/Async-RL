@@ -23,7 +23,6 @@ class SharedAdam(torch.optim.Adam):
 
 def setup_wandb(config):
     """Initialize wandb for experiment tracking."""
-    # This is now only used for validation - actual init happens in logger process
     pass
 
 def metrics_logger(metric_queue, num_workers, config, log_interval=100):
@@ -31,7 +30,6 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
     Separate process to handle metrics logging to wandb.
     This prevents blocking the training workers.
     """
-    # Initialize wandb in the logger process
     wandb.init(
         project="a3c-cartpole",
         config=config,
@@ -63,12 +61,11 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
             
             # Log to wandb periodically
             current_time = time.time()
-            if step_count % log_interval == 0 or current_time - last_log_time > 30:  # Every 100 steps or 30 seconds
+            if step_count % log_interval == 0 or current_time - last_log_time > 30: 
                 log_aggregated_metrics(worker_metrics, step_count)
                 last_log_time = current_time
                 
         except:
-            # Timeout or queue empty, continue
             continue
     
     # Final logging
@@ -89,37 +86,37 @@ def log_aggregated_metrics(worker_metrics, step):
         
         if rewards:
             all_rewards.extend(rewards)
-            worker_stats[f'worker_{worker_id}_avg_reward'] = np.mean(rewards[-10:]) if len(rewards) >= 10 else np.mean(rewards)
-            worker_stats[f'worker_{worker_id}_latest_reward'] = rewards[-1]
+            worker_stats[f'worker_{worker_id}/avg_reward'] = np.mean(rewards[-10:]) if len(rewards) >= 10 else np.mean(rewards)
+            worker_stats[f'worker_{worker_id}/latest_reward'] = rewards[-1]
         
         if losses:
             all_losses.extend(losses)
-            worker_stats[f'worker_{worker_id}_avg_loss'] = np.mean(losses[-10:]) if len(losses) >= 10 else np.mean(losses)
+            worker_stats[f'worker_{worker_id}/avg_loss'] = np.mean(losses[-10:]) if len(losses) >= 10 else np.mean(losses)
         
         if entropies:
             all_entropies.extend(entropies)
-            worker_stats[f'worker_{worker_id}_avg_entropy'] = np.mean(entropies[-10:]) if len(entropies) >= 10 else np.mean(entropies)
+            worker_stats[f'worker_{worker_id}/avg_entropy'] = np.mean(entropies[-10:]) if len(entropies) >= 10 else np.mean(entropies)
     
     log_data = {'global_step': step}
     
     if all_rewards:
         log_data.update({
-            'global_avg_reward': np.mean(all_rewards),
-            'global_max_reward': np.max(all_rewards),
-            'global_min_reward': np.min(all_rewards),
+            'global/avg_reward': np.mean(all_rewards),
+            'global/max_reward': np.max(all_rewards),
+            'global/min_reward': np.min(all_rewards),
             'total_episodes': len(all_rewards),
         })
     
     if all_losses:
         log_data.update({
-            'global_avg_loss': np.mean(all_losses),
-            'global_max_loss': np.max(all_losses),
-            'global_min_loss': np.min(all_losses),
+            'globa/avg_loss': np.mean(all_losses),
+            'global/max_loss': np.max(all_losses),
+            'global/min_loss': np.min(all_losses),
         })
     
     if all_entropies:
         log_data.update({
-            'global_avg_entropy': np.mean(all_entropies),
+            'global/avg_entropy': np.mean(all_entropies),
         })
     
     log_data.update(worker_stats)
@@ -145,8 +142,6 @@ def main():
         'max_episodes': 1000
     }
     
-    # Don't initialize wandb in main process anymore
-    # setup_wandb(config)
 
     global_model = ActorCritic(input_dim, action_dim)
     global_model.share_memory()
@@ -173,16 +168,12 @@ def main():
         p.start()
         processes.append(p)
 
-    # Wait for all workers to complete
     for p in processes:
         p.join()
 
-    # Signal logger to shutdown and wait
     metric_queue.put(None)
     logger_process.join()
-    
-    # Don't call wandb.finish() here since it's handled in the logger process
-    
+        
     print("Training completed! Check your wandb dashboard for visualizations.")
 
 if __name__ == "__main__":
