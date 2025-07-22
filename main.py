@@ -7,6 +7,9 @@ from collections import deque
 import time
 from model import ActorCritic
 from worker import worker_fn
+import subprocess
+import os
+import glob
 
 class SharedAdam(torch.optim.Adam):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), eps=1e-8,
@@ -46,6 +49,9 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
     
     step_count = 0
     last_log_time = time.time()
+
+    
+    
     
     while True:
         try:
@@ -63,7 +69,12 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
             current_time = time.time()
             if step_count % log_interval == 0 or current_time - last_log_time > 30: 
                 log_aggregated_metrics(worker_metrics, step_count)
+                final_vid = concat_worker_videos(worker_id)
+                if final_vid:
+                    wandb.log({f"worker_{worker_id}_full_video": wandb.Video(final_vid, caption=f"Worker {worker_id}", fps=30, format="mp4")})
+
                 last_log_time = current_time
+
                 
         except:
             continue
@@ -71,6 +82,34 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
     # Final logging
     log_aggregated_metrics(worker_metrics, step_count)
     wandb.finish()
+
+
+def concat_worker_videos(worker_id):
+    video_dir = f"./videos/worker_{worker_id}"
+    file_list_txt = os.path.join(video_dir, "file_list.txt")
+    
+    video_files = sorted(glob.glob(os.path.join(video_dir, "*.mp4")))
+    if not video_files:
+        print(f"No videos found for worker {worker_id}")
+        return None
+
+    with open(file_list_txt, "w") as f:
+        for vf in video_files:
+            f.write(f"file '{os.path.abspath(vf)}'\n")
+
+    output_file = os.path.join(video_dir, f"worker_{worker_id}_combined.mp4")
+    
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", file_list_txt,
+            "-c", "copy", output_file
+        ], check=True)
+        return output_file
+    except subprocess.CalledProcessError:
+        print(f"Failed to merge videos for worker {worker_id}")
+        return None
+
 
 def log_aggregated_metrics(worker_metrics, step):
     """Log aggregated metrics to wandb."""
@@ -137,7 +176,7 @@ def main():
         'input_dim': input_dim,
         'action_dim': action_dim,
         'lr': 1e-4,
-        'num_workers': 4,
+        'num_workers': 8,
         'algorithm': 'A3C',
         'max_episodes': 1000
     }

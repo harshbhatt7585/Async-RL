@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import gym
 import numpy as np
 from model import ActorCritic
-from gym.wrappers import RecordVideo
+from gym.wrappers import RecordVideo, TimeLimit
 import os
 
 
@@ -13,10 +13,14 @@ def worker_fn(global_model, global_optimizer, env_name, worker_id, metric_queue,
 
     torch.manual_seed(worker_id + 1000)
     np.random.seed(worker_id + 1000)
-    env = RecordVideo(gym.make(env_name, render_mode='rgb_array'),
-                  video_folder=video_folder,
-                  episode_trigger=lambda ep: ep % 50 == 0,
-                  name_prefix=f"worker{worker_id}")
+    env = gym.make(env_name, render_mode='rgb_array')
+    env = RecordVideo(
+        env,
+        video_folder=video_folder,
+        episode_trigger=lambda ep: ep >= 200 and ep % 50 == 0,
+        name_prefix=f"worker{worker_id}"
+    )
+
     env.reset(seed=worker_id + 1000)
 
     local_model = ActorCritic(env.observation_space.shape[0], env.action_space.n)
