@@ -50,9 +50,6 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
     step_count = 0
     last_log_time = time.time()
 
-    
-    
-    
     while True:
         try:
             # Non-blocking get with timeout
@@ -65,22 +62,24 @@ def metrics_logger(metric_queue, num_workers, config, log_interval=100):
             worker_metrics[worker_id][metric_type].append(value)
             step_count += 1
             
-            # Log to wandb periodically
+            # Log to wandb periodically (without videos)
             current_time = time.time()
             if step_count % log_interval == 0 or current_time - last_log_time > 30: 
                 log_aggregated_metrics(worker_metrics, step_count)
-                final_vid = concat_worker_videos(worker_id)
-                if final_vid:
-                    wandb.log({f"worker_{worker_id}_full_video": wandb.Video(final_vid, caption=f"Worker {worker_id}", fps=30, format="mp4")})
-
                 last_log_time = current_time
-
                 
         except:
             continue
     
-    # Final logging
+    # Final logging with combined videos
     log_aggregated_metrics(worker_metrics, step_count)
+    
+    # Create and log combined videos for each worker at the end
+    for worker_id in range(num_workers):
+        final_vid = concat_worker_videos(worker_id)
+        if final_vid:
+            wandb.log({f"worker_{worker_id}_full_video": wandb.Video(final_vid, caption=f"Worker {worker_id}", fps=30, format="mp4")})
+    
     wandb.finish()
 
 
@@ -148,7 +147,7 @@ def log_aggregated_metrics(worker_metrics, step):
     
     if all_losses:
         log_data.update({
-            'globa/avg_loss': np.mean(all_losses),
+            'global/avg_loss': np.mean(all_losses),  # Fixed typo: was 'globa/avg_loss'
             'global/max_loss': np.max(all_losses),
             'global/min_loss': np.min(all_losses),
         })
