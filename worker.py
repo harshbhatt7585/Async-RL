@@ -4,7 +4,7 @@ import gym
 import numpy as np
 from model import ActorCritic
 
-def worker_fn(global_model, global_optimizer, env_name, worker_id, metrics, gamma=0.99, t_max=20, max_episodes=1000):
+def worker_fn(global_model, global_optimizer, env_name, worker_id, metric_queue, max_episodes=1000, gamma=0.99, t_max=20):
     torch.manual_seed(worker_id + 1000)
     np.random.seed(worker_id + 1000)
     env = gym.make(env_name)
@@ -17,11 +17,11 @@ def worker_fn(global_model, global_optimizer, env_name, worker_id, metrics, gamm
     step_count = 0
 
     while episode < max_episodes:
-        # Copy weights
+        # Copy weights from global model
         local_model.load_state_dict(global_model.state_dict())
 
         values, log_probs, rewards, entropies = [], [], [], []
-        total_reward = 0.0
+        episode_reward = 0.0
 
         # Collect t_max steps of experience
         for _ in range(t_max):
@@ -33,25 +33,30 @@ def worker_fn(global_model, global_optimizer, env_name, worker_id, metrics, gamm
             action = dist.sample()
 
             next_state, reward, done, _, _ = env.step(int(action.item()))
-            total_reward += reward
+            episode_reward += reward
 
             values.append(value)
             log_probs.append(log_prob_dist.gather(1, action.unsqueeze(0)))
             rewards.append(reward)
-            entropies.append(-(log_prob_dist * prob).sum(1))
+            entropies.append(-(log_prob_dist * prob).sum(1, keepdim=True))
 
             state = next_state
             step_count += 1
 
             if done:
+                # Send episode reward to metrics queue (non-blocking)
+                try:
+                    metric_queue.put((worker_id, 'rewards', episode_reward), block=False)
+                except:
+                    pass  # Queue full, skip this metric
+                
+                # Reset for next episode
                 state, _ = env.reset()
                 episode += 1
-                # record metric
-                metrics[worker_id].append(total_reward)
-                total_reward = 0.0
+                episode_reward = 0.0
                 break
 
-        # Bootstrap
+        # Bootstrap value for next state (if not terminal)
         if done:
             R = torch.zeros(1, 1)
         else:
@@ -59,38 +64,59 @@ def worker_fn(global_model, global_optimizer, env_name, worker_id, metrics, gamm
             _, value = local_model(state_tensor)
             R = value.detach()
 
+        # Compute returns using discounted rewards
         returns = []
         for r in reversed(rewards):
             R = r + gamma * R
             returns.insert(0, R)
 
+        # Convert to tensors
         returns = torch.cat(returns).detach()
         values = torch.cat(values)
         log_probs = torch.cat(log_probs)
         entropies = torch.cat(entropies)
 
-        # Advantage
+        # Compute advantages
         advantages = returns - values
+        
+        # Normalize advantages (only if we have multiple samples)
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Loss
+        # Compute losses
         policy_loss = -(log_probs * advantages.detach()).mean()
         value_loss = F.mse_loss(values, returns)
         entropy_loss = -entropies.mean()
-        loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+        total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
 
-        # Backprop
-        loss.backward()
-        # Push gradients to shared model
+        # Send metrics to queue (non-blocking to avoid slowing down training)
+        try:
+            metric_queue.put((worker_id, 'losses', total_loss.item()), block=False)
+            metric_queue.put((worker_id, 'entropies', -entropy_loss.item()), block=False)
+            metric_queue.put((worker_id, 'policy_losses', policy_loss.item()), block=False)
+            metric_queue.put((worker_id, 'value_losses', value_loss.item()), block=False)
+        except:
+            pass  # Queue full, skip these metrics
+
+        # Zero gradients
+        global_optimizer.zero_grad()
+        
+        # Backpropagate
+        total_loss.backward()
+        
+        # Copy gradients from local model to global model
         for local_param, global_param in zip(local_model.parameters(), global_model.parameters()):
-            global_param._grad = local_param.grad.clone()
+            if global_param._grad is not None:
+                global_param._grad += local_param.grad
+            else:
+                global_param._grad = local_param.grad.clone()
 
+        # Clip gradients and update global model
         torch.nn.utils.clip_grad_norm_(global_model.parameters(), max_norm=5.0)
         global_optimizer.step()
-        global_optimizer.zero_grad()
 
-        if episode > 0 and episode % 10 == 0:
-            print(f"[Worker {worker_id}] Episode: {episode}, Reward: {metrics[worker_id][-1]:.2f}, Loss: {loss.item():.3f}")
+        # Print progress (less frequent to reduce overhead)
+        if episode > 0 and episode % 50 == 0:
+            print(f"[Worker {worker_id}] Episode: {episode}, Latest Loss: {total_loss.item():.3f}")
 
     env.close()

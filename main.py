@@ -1,7 +1,10 @@
 import torch
 import torch.multiprocessing as mp
 import gym
-import matplotlib.pyplot as plt
+import wandb
+import numpy as np
+from collections import deque
+import time
 from model import ActorCritic
 from worker import worker_fn
 
@@ -18,29 +21,109 @@ class SharedAdam(torch.optim.Adam):
                 state['exp_avg'].share_memory_()
                 state['exp_avg_sq'].share_memory_()
 
+def setup_wandb(config):
+    """Initialize wandb for experiment tracking."""
+    # This is now only used for validation - actual init happens in logger process
+    pass
 
-def plot_metrics(metrics, num_workers):
+def metrics_logger(metric_queue, num_workers, config, log_interval=100):
     """
-    Plot each worker's rewards in a single figure with subplots.
+    Separate process to handle metrics logging to wandb.
+    This prevents blocking the training workers.
     """
-    # Create a vertical grid of subplots
-    fig, axes = plt.subplots(nrows=num_workers, ncols=1, figsize=(8, 4 * num_workers), sharex=True)
-    # If only one worker, axes is not an array
-    if num_workers == 1:
-        axes = [axes]
+    # Initialize wandb in the logger process
+    wandb.init(
+        project="a3c-cartpole",
+        config=config,
+        name=f"a3c-{config['num_workers']}workers-lr{config['lr']}"
+    )
+    
+    worker_metrics = {i: {
+        'rewards': deque(maxlen=1000),
+        'losses': deque(maxlen=1000),
+        'entropies': deque(maxlen=1000),
+        'policy_losses': deque(maxlen=1000),
+        'value_losses': deque(maxlen=1000)
+    } for i in range(num_workers)}
+    
+    step_count = 0
+    last_log_time = time.time()
+    
+    while True:
+        try:
+            # Non-blocking get with timeout
+            data = metric_queue.get(timeout=1.0)
+            
+            if data is None:  # Shutdown signal
+                break
+                
+            worker_id, metric_type, value = data
+            worker_metrics[worker_id][metric_type].append(value)
+            step_count += 1
+            
+            # Log to wandb periodically
+            current_time = time.time()
+            if step_count % log_interval == 0 or current_time - last_log_time > 30:  # Every 100 steps or 30 seconds
+                log_aggregated_metrics(worker_metrics, step_count)
+                last_log_time = current_time
+                
+        except:
+            # Timeout or queue empty, continue
+            continue
+    
+    # Final logging
+    log_aggregated_metrics(worker_metrics, step_count)
+    wandb.finish()
 
-    for wid, ax in enumerate(axes):
-        rewards = list(metrics[wid])
+def log_aggregated_metrics(worker_metrics, step):
+    """Log aggregated metrics to wandb."""
+    all_rewards = []
+    all_losses = []
+    all_entropies = []
+    worker_stats = {}
+    
+    for worker_id, metrics in worker_metrics.items():
+        rewards = list(metrics['rewards'])
+        losses = list(metrics['losses'])
+        entropies = list(metrics['entropies'])
+        
         if rewards:
-            ax.plot(rewards)
-        ax.set_title(f'Worker {wid} Episode Rewards')
-        ax.set_ylabel('Reward')
-        ax.grid(True)
-
-    axes[-1].set_xlabel('Episode')
-    fig.tight_layout()
-    plt.show()
-
+            all_rewards.extend(rewards)
+            worker_stats[f'worker_{worker_id}_avg_reward'] = np.mean(rewards[-10:]) if len(rewards) >= 10 else np.mean(rewards)
+            worker_stats[f'worker_{worker_id}_latest_reward'] = rewards[-1]
+        
+        if losses:
+            all_losses.extend(losses)
+            worker_stats[f'worker_{worker_id}_avg_loss'] = np.mean(losses[-10:]) if len(losses) >= 10 else np.mean(losses)
+        
+        if entropies:
+            all_entropies.extend(entropies)
+            worker_stats[f'worker_{worker_id}_avg_entropy'] = np.mean(entropies[-10:]) if len(entropies) >= 10 else np.mean(entropies)
+    
+    log_data = {'global_step': step}
+    
+    if all_rewards:
+        log_data.update({
+            'global_avg_reward': np.mean(all_rewards),
+            'global_max_reward': np.max(all_rewards),
+            'global_min_reward': np.min(all_rewards),
+            'total_episodes': len(all_rewards),
+        })
+    
+    if all_losses:
+        log_data.update({
+            'global_avg_loss': np.mean(all_losses),
+            'global_max_loss': np.max(all_losses),
+            'global_min_loss': np.min(all_losses),
+        })
+    
+    if all_entropies:
+        log_data.update({
+            'global_avg_entropy': np.mean(all_entropies),
+        })
+    
+    log_data.update(worker_stats)
+    wandb.log(log_data)
 
 def main():
     mp.set_start_method("spawn")
@@ -51,30 +134,56 @@ def main():
     action_dim = dummy_env.action_space.n
     dummy_env.close()
 
+    # Configuration
+    config = {
+        'env_name': env_name,
+        'input_dim': input_dim,
+        'action_dim': action_dim,
+        'lr': 1e-4,
+        'num_workers': 4,
+        'algorithm': 'A3C',
+        'max_episodes': 1000
+    }
+    
+    # Don't initialize wandb in main process anymore
+    # setup_wandb(config)
+
     global_model = ActorCritic(input_dim, action_dim)
     global_model.share_memory()
 
-    lr = 1e-4
-    global_optimizer = SharedAdam(global_model.parameters(), lr=lr)
+    global_optimizer = SharedAdam(global_model.parameters(), lr=config['lr'])
 
-    num_workers = 4
-    manager = mp.Manager()
-    metrics = manager.dict({i: manager.list() for i in range(num_workers)})
+    # Use multiprocessing Queue instead of manager.dict - much faster!
+    metric_queue = mp.Queue(maxsize=10000)  # Large buffer to prevent blocking
+    
+    # Start metrics logger process
+    logger_process = mp.Process(
+        target=metrics_logger, 
+        args=(metric_queue, config['num_workers'], config)
+    )
+    logger_process.start()
 
+    # Start worker processes
     processes = []
-    for worker_id in range(num_workers):
+    for worker_id in range(config['num_workers']):
         p = mp.Process(
             target=worker_fn,
-            args=(global_model, global_optimizer, env_name, worker_id, metrics)
+            args=(global_model, global_optimizer, env_name, worker_id, metric_queue, config['max_episodes'])
         )
         p.start()
         processes.append(p)
 
+    # Wait for all workers to complete
     for p in processes:
         p.join()
 
-    plot_metrics(metrics, num_workers)
-
+    # Signal logger to shutdown and wait
+    metric_queue.put(None)
+    logger_process.join()
+    
+    # Don't call wandb.finish() here since it's handled in the logger process
+    
+    print("Training completed! Check your wandb dashboard for visualizations.")
 
 if __name__ == "__main__":
     main()
