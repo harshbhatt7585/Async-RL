@@ -2,8 +2,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
+import torch.distributed.rpc as rpc
 import numpy as np
 import gym
 
@@ -20,116 +20,124 @@ class ActorCritic(nn.Module):
         return self.policy(x), self.value(x)
 
 
-def ddp_setup():
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
-    return local_rank, global_rank
+# Global model container for RPC
+class GlobalModel:
+    def __init__(self, obs_dim, act_dim):
+        self.model = ActorCritic(obs_dim, act_dim)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
+
+    def apply_gradients(self, grads):
+        for p, g in zip(self.model.parameters(), grads):
+            if p.grad is None:
+                p.grad = g
+            else:
+                p.grad += g
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+    def get_weights(self):
+        return {k: v.cpu() for k, v in self.model.state_dict().items()}
 
 
-def rollout(env, local_model, t_max, device):
-    state, _ = env.reset()
-    values, log_probs, rewards, entropies = [], [], [], []
-    episode_reward = 0.0
-
-    for _ in range(t_max):
-        with torch.no_grad():
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            logits, value = local_model(state_tensor)
-            probs = F.softmax(logits, dim=-1)
-            log_probs_dist = F.log_softmax(logits, dim=-1)
-            dist_ = torch.distributions.Categorical(probs)
-            action = dist_.sample()
-
-        next_state, reward, done, _, _ = env.step(action.item())
-
-        values.append(value)
-        log_probs.append(log_probs_dist.gather(1, action.unsqueeze(0)))
-        rewards.append(torch.tensor([reward], dtype=torch.float32, device=device))
-        entropies.append(-(log_probs_dist * probs).sum(1, keepdim=True))
-
-        episode_reward += reward
-        state = next_state
-
-        if done:
-            state, _ = env.reset()
-            break
-
-    return values, log_probs, rewards, entropies, episode_reward
+def remote_apply_gradients(grads):
+    return GLOBAL_MODEL.apply_gradients(grads)
 
 
-def average_gradients(model):
-    # Gradient averaging across all processes
-    for param in model.parameters():
-        if param.grad is not None:
-            dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-            param.grad.data /= dist.get_world_size()
+def remote_get_weights():
+    return GLOBAL_MODEL.get_weights()
 
 
-def train_worker(global_model, env_name, t_max=20, gamma=0.99, max_episodes=1000, sync_interval=10):
-    local_rank, global_rank = ddp_setup()
-    device = torch.device(f"cuda:{local_rank}")
-    global_model.to(device)
-    global_model = DDP(global_model, device_ids=[local_rank], find_unused_parameters=True)
+def rollout_worker(rank, world_size, env_name, t_max, gamma, max_episodes):
+    rpc.init_rpc(f"worker{rank}", rank=rank, world_size=world_size)
 
-    optimizer = torch.optim.Adam(global_model.parameters(), lr=1e-4)
     env = gym.make(env_name)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.n
 
-    episode = 0
-    while episode < max_episodes:
-        values, log_probs, rewards, entropies, episode_reward = rollout(env, global_model.module, t_max, device)
+    local_model = ActorCritic(obs_dim, act_dim)
 
-        # Bootstrap value
-        with torch.no_grad():
-            state_tensor = torch.tensor(env.reset()[0], dtype=torch.float32, device=device).unsqueeze(0)
-            _, next_value = global_model.module(state_tensor)
-            R = next_value.detach()
+    for episode in range(max_episodes):
+        # Pull latest weights
+        state_dict = rpc.rpc_sync("ps", remote_get_weights, args=())
+        local_model.load_state_dict(state_dict)
 
+        values, log_probs, rewards, entropies = [], [], [], []
+        state, _ = env.reset()
+
+        for _ in range(t_max):
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                logits, value = local_model(state_tensor)
+            probs = F.softmax(logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+
+            next_state, reward, done, _, _ = env.step(action.item())
+
+            values.append(value)
+            log_probs.append(torch.log(probs[0, action]))
+            rewards.append(reward)
+            entropies.append(-(probs * probs.log()).sum())
+
+            state = next_state
+            if done:
+                break
+
+        R = torch.zeros(1, 1)
         returns = []
         for r in reversed(rewards):
-            R = r + gamma * R
+            R = torch.tensor([[r]]) + gamma * R
             returns.insert(0, R)
 
-        returns = torch.cat(returns)
         values = torch.cat(values)
-        log_probs = torch.cat(log_probs)
-        entropies = torch.cat(entropies)
+        log_probs = torch.stack(log_probs).unsqueeze(1)
+        entropies = torch.stack(entropies).unsqueeze(1)
+        returns = torch.cat(returns).detach()
 
-        advantages = returns - values
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        policy_loss = -(log_probs * advantages.detach()).mean()
+        advantage = returns - values
+        policy_loss = -(log_probs * advantage.detach()).mean()
         value_loss = F.mse_loss(values, returns)
         entropy_loss = -entropies.mean()
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
 
-        optimizer.zero_grad()
+        # Compute gradients
+        local_model.zero_grad()
         total_loss.backward()
+        grads = [p.grad for p in local_model.parameters()]
 
-        # Periodic sync across workers
-        if episode % sync_interval == 0:
-            average_gradients(global_model)
-        optimizer.step()
+        # Push to global model
+        rpc.rpc_sync("ps", remote_apply_gradients, args=(grads,))
 
-        if global_rank == 0 and episode % 10 == 0:
-            print(f"[Rank {global_rank}] Episode {episode} | Reward: {episode_reward:.2f} | Loss: {total_loss.item():.3f}")
+        if episode % 10 == 0:
+            print(f"Worker {rank} | Episode {episode} | Reward: {sum(rewards):.2f}")
 
-        episode += 1
+    rpc.shutdown()
 
+
+def run_rpc(env_name, world_size, t_max=20, gamma=0.99, max_episodes=200):
+    mp.set_start_method("spawn", force=True)
+
+    env = gym.make(env_name)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.n
     env.close()
-    dist.destroy_process_group()
+
+    global GLOBAL_MODEL
+    GLOBAL_MODEL = GlobalModel(obs_dim, act_dim)
+
+    rpc.init_rpc("ps", rank=0, world_size=world_size)
+
+    processes = []
+    for rank in range(1, world_size):
+        p = mp.Process(target=rollout_worker, args=(rank, world_size, env_name, t_max, gamma, max_episodes))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    rpc.shutdown()
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env_name", type=str, default="CartPole-v1")
-    args = parser.parse_args()
-
-    env = gym.make(args.env_name)
-    model = ActorCritic(env.observation_space.shape[0], env.action_space.n)
-    env.close()
-
-    train_worker(model, env_name=args.env_name)
+    run_rpc(env_name="CartPole-v1", world_size=3)  # 1 PS + 2 Workers
